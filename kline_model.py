@@ -102,81 +102,56 @@ class Block(nn.Module):
 class KlineGPT(nn.Module):
     def __init__(
         self,
-        vocab_size: int,
+        input_vocab_size: int = 256,     # 4 特征 × 64 桶
+        output_vocab_size: int = 64,     # 只预测 close
         n_feat: int = 4,
-        n_layer: int = 6,
+        n_layer: int = 4,
         n_head: int = 8,
-        n_embd: int = 256,
-        max_kline_seq: int = 512,
-        use_learnable_fuse: bool = True,   # 新增开关
-        dropout_rate=0.1
+        n_embd: int = 128,
+        max_kline_seq: int = 256,
+        use_learnable_fuse: bool = True,
+        dropout_rate: float = 0.1,
     ):
         super().__init__()
-        self.vocab_size = vocab_size
+        self.input_vocab_size = input_vocab_size
+        self.output_vocab_size = output_vocab_size
         self.n_feat = n_feat
         self.n_embd = n_embd
         self.max_kline_seq = max_kline_seq
         self.use_learnable_fuse = use_learnable_fuse
+
         self.rope = RoPE(dim=n_embd // n_head, max_kline_len=max_kline_seq)
-        self.wte = nn.Embedding(vocab_size, n_embd)
-        # 只有开启才创建kline_fuse层
-        if self.use_learnable_fuse:
-            self.kline_fuse = nn.Sequential(
-                nn.Linear(n_feat * n_embd, n_embd, bias=False),            
-            )
+        self.wte = nn.Embedding(input_vocab_size, n_embd)   # 256
+        if use_learnable_fuse:
+            self.kline_fuse = nn.Linear(n_feat * n_embd, n_embd, bias=False)
 
         self.blocks = nn.ModuleList([
-            Block(n_embd, n_head, self.rope,max_kline_seq,dropout_rate) for _ in range(n_layer)
+            Block(n_embd, n_head, self.rope, max_kline_seq, dropout_rate)
+            for _ in range(n_layer)
         ])
         self.ln_f = nn.RMSNorm(n_embd)
+        self.head = nn.Linear(n_embd, output_vocab_size, bias=False)   # 64
 
-        self.heads = nn.ModuleList([
-            nn.Linear(n_embd, vocab_size, bias=False) for _ in range(n_feat)
-        ])
-        
-
-    def forward(self, kline_tokens: torch.Tensor, targets: torch.Tensor = None):
-        B, T, C_feat = kline_tokens.shape
+    def forward(self, kline_tokens, targets=None):
+        B, T, _ = kline_tokens.shape
         emb = self.wte(kline_tokens)
-        
         if self.use_learnable_fuse:
-            emb_flat = emb.reshape(B, T, -1)
-            x = self.kline_fuse(emb_flat)
+            x = self.kline_fuse(emb.reshape(B, T, -1))
         else:
             x = emb.mean(dim=2)
-
         for block in self.blocks:
             x = block(x)
         x = self.ln_f(x)
-
-        logits_list = [h(x) for h in self.heads]
+        logits = self.head(x[:, -1, :])          # (B, 64)
         loss = None
         if targets is not None:
-            loss = 0.0
-            for i in range(self.n_feat):
-                logit = logits_list[i]
-                y = targets[..., i]
-                loss += F.cross_entropy(
-                    logit.reshape(-1, self.vocab_size),
-                    y.reshape(-1)
-                )
-            loss = loss / self.n_feat
-        return logits_list, loss
+            loss = F.cross_entropy(logits, targets)
+        return logits, loss
 
     @torch.no_grad()
-    def generate_next_kline(self, ctx_tokens: torch.Tensor, temperature=1.0):
-        B, T, _ = ctx_tokens.shape
+    def generate_next_kline(self, ctx_tokens, temperature=1.0):
         temperature = max(temperature, 1e-6)
         ctx_cond = ctx_tokens[:, -self.max_kline_seq:, :]
-        logits_list, _ = self(ctx_cond)
-        last_logits = [l[:, -1, :] for l in logits_list]
-
-        next_tokens = []
-        for logit in last_logits:
-            logit = logit / temperature
-            prob = F.softmax(logit, dim=-1)
-            tid = torch.multinomial(prob, num_samples=1)
-            next_tokens.append(tid)
-        next_kline = torch.cat(next_tokens, dim=-1).unsqueeze(1)
-        return next_kline
-
+        logits, _ = self(ctx_cond)
+        prob = F.softmax(logits / temperature, dim=-1)
+        return torch.multinomial(prob, num_samples=1)   # (B, 1)

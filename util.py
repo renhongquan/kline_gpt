@@ -37,14 +37,13 @@ class KlineSeqDataset(Dataset):
         assert len(self.data) == len(self.close_ref)
 
     def __len__(self):
-        return len(self.data) - self.seq_len
+        return max(0, len(self.data) - self.seq_len)
 
     def __getitem__(self, idx):
-        x = self.data[idx : idx + self.seq_len]
-        y = self.data[idx+1 : idx + self.seq_len + 1]
-        # 窗口最后一根收盘价，作为推理锚点
+        x = self.data[idx : idx + self.seq_len]          # (256, 4)
+        y = self.data[idx + self.seq_len, 0]             # 只取 close token，标量
         last_close = self.close_ref[idx + self.seq_len - 1]
-        return x, y,last_close
+        return x, y, last_close
 
 def get_dataloader(seq_len,batch_size,SPLIT_RATIO_1,SPLIT_RATIO_2,data_npy,close_npy):    
     # 加载预处理好的token，stacked_tokens: [N,4] int64 add_offset完成
@@ -57,13 +56,15 @@ def get_dataloader(seq_len,batch_size,SPLIT_RATIO_1,SPLIT_RATIO_2,data_npy,close
     n_total = len(df_np)
     n_train = int(n_total * SPLIT_RATIO_1)
     n_val   = int(n_total * (SPLIT_RATIO_1+SPLIT_RATIO_2))
+    
+    GAP = seq_len
     train_arr = df_np[:n_train]
-    val_arr = df_np[n_train:n_val]
-    test_arr = df_np[n_val:]
+    val_arr = df_np[n_train + GAP : n_val]
+    test_arr = df_np[n_val + GAP :]
 
     train_close_arr = close_np[:n_train]
-    val_close_arr = close_np[n_train:n_val]
-    test_close_arr = close_np[n_val:]
+    val_close_arr = close_np[n_train + GAP :n_val]
+    test_close_arr = close_np[n_val + GAP :]
 
     print(f"total kline: {n_total}, train: {len(train_arr)}, val: {len(val_arr)} test: {len(test_arr)}")
 
@@ -168,23 +169,4 @@ def load_checkpoint(model, optimizer, scheduler,ckpt_path="ckpt.pt", device="cud
     print(f"✅ 加载模型成功，从 epoch {start_epoch} 继续训练")
     return start_epoch, train_hist, val_hist, es_state, best_val_loss
 
-def rel_to_kline(prev_close: float, close_rel: float, high_rel: float, low_rel: float, vol_rel: float):
-    """
-    输入：上一根收盘价 + 4个rel
-    返回：dict K线
-    """
-    close = prev_close * (1.0 + close_rel)
-    high = prev_close * (1.0 + high_rel)
-    low = prev_close * (1.0 + low_rel)
-    open_ = prev_close  # 当前没有预测open_rel，先用前收代替
-    vol = None # vol_rel是相对量比，不是真实成交量，需要单独处理
-    # 安全约束：high >= max(open_, close), low <= min(open_, close)
-    high = max(high, open_, close)
-    low = min(low, open_, close)
-    return {
-        "open": open_,
-        "high": high,
-        "low": low,
-        "close": close,
-        "vol_rel": vol_rel
-    }
+

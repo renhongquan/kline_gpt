@@ -16,99 +16,61 @@ from kline_model import *
 def train_one_epoch(model, loader, opt, device):
     model.train()
     total_loss = 0.0
-    GRAD_NORM_MAX_THRESHOLD = 5.0    # raw norm超过这个值，告警梯度爆炸风险
-    GRAD_NORM_MIN_THRESHOLD = 1e-3   # raw norm低于这个值，告警梯度消失风险
-    ALERT_WINDOW = 10                # 连续多少个batch触发才告警，避免单点噪声
+    hard_correct = 0
+    total = 0
     grad_norm_history = []
     loader_count = 0
-    feat_names = ["close_rel", "high_rel", "low_rel", "vol_rel"]
-    n_feat = model.n_feat
-    total_sum_loss = 0.0
-    feat_loss_sum = [0.0] * n_feat
-    feat_cnt = [0] * n_feat
-    feat_hard_correct = [0] * n_feat
-    feat_soft_correct = [0] * n_feat
-    feat_total = [0] * n_feat
-    total_step=len(loader)
+    total_step = len(loader)
+    GRAD_NORM_MAX = 6.0
+    GRAD_NORM_MIN = 1e-3
+    ALERT_WINDOW = 10
+
     for x, y, _ in loader:
         x, y = x.to(device), y.to(device)
         opt.zero_grad(set_to_none=True)
-        logits_list, loss = model(x, y)
+        logits, loss = model(x, y)          # logits: (B, 64)
         loss.backward()
-        total_norm = torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
-        if loader_count % 5 ==0:
+        total_norm = torch.nn.utils.clip_grad_norm_(model.parameters(), 2.0)
+        if loader_count % 100 == 0:
             print(f"current step {loader_count}/{total_step} grad : {total_norm}")
-        loader_count=loader_count+1
-        raw_norm_val = total_norm.item()   
+        loader_count += 1
         opt.step()
         total_loss += loss.item()
-        grad_norm_history.append(raw_norm_val)
-        # 只保留最近ALERT_WINDOW个，防止列表无限变长
+
+        pred = logits.argmax(dim=-1)        # (B,)
+        hard_correct += (pred == y).sum().item()
+        total += y.size(0)
+
+        grad_norm_history.append(total_norm.item())
         if len(grad_norm_history) > ALERT_WINDOW:
             grad_norm_history.pop(0)
-
-        # 连续窗口判断告警
         if len(grad_norm_history) == ALERT_WINDOW:
-            arr = np.array(grad_norm_history)
-            avg_norm = arr.mean()
+            avg = np.mean(grad_norm_history)
+            if avg > GRAD_NORM_MAX:
+                print(f"⚠️ 梯度norm偏高 avg={avg:.4f}")
+            if avg < GRAD_NORM_MIN:
+                print(f"⚠️ 梯度norm很低 avg={avg:.6f}")
 
-            if avg_norm > GRAD_NORM_MAX_THRESHOLD:
-                print(f"⚠️ 【梯度告警】连续{ALERT_WINDOW} batch 梯度norm偏高！avg={avg_norm:.4f}, > {GRAD_NORM_MAX_THRESHOLD}，建议降低LR")
-            if avg_norm < GRAD_NORM_MIN_THRESHOLD:
-                print(f"⚠️ 【梯度告警】连续{ALERT_WINDOW} batch 梯度norm很低！avg={avg_norm:.6f}, < {GRAD_NORM_MIN_THRESHOLD}，警惕梯度消失")
-
-        for i in range(n_feat):
-            logit = logits_list[i]
-            y_target = y[..., i]
-
-            feat_loss = F.cross_entropy(
-                logit.reshape(-1, model.vocab_size),
-                y_target.reshape(-1)
-            )
-            feat_loss_sum[i] += feat_loss.item()
-            feat_cnt[i] += 1
-
-            pred = logit.argmax(dim=-1)
-            y_flat = y_target.reshape(-1)
-            pred_flat = pred.reshape(-1)
-
-            hard_mask = (pred_flat == y_flat)
-            feat_hard_correct[i] += hard_mask.sum().item()
-
-            soft_mask = torch.abs(pred_flat - y_flat) <= 1
-            feat_soft_correct[i] += soft_mask.sum().item()
-
-            feat_total[i] += y_flat.size(0)
-        
-    #t_end = time.time()
-    #print(f"    train_one_epoch finished, cost: {t_end - t_start:.2f} s")
-    feat_result = {}
-    for idx, name in enumerate(feat_names):
-        feat_result[name] = {
-            "loss": feat_loss_sum[idx] / max(feat_cnt[idx], 1),
-            "hard_acc": feat_hard_correct[idx] / max(feat_total[idx], 1),
-            "soft_adj_bin": feat_soft_correct[idx] / max(feat_total[idx], 1)
-        }
-
-    # 控制台打印详细指标
-    print("\n==== Eval Feature Metrics ====")
-    for name in feat_names:
-        d = feat_result[name]
-        print(f"{name:<10s} | loss:{d['loss']:.4f} | hard_acc:{d['hard_acc']:.4f} | soft_adj_acc:{d['soft_adj_bin']:.4f}")
-    print("==============================\n")
+    acc = hard_correct / max(total, 1)
+    print(f"\n==== Train close_rel hard_acc: {acc:.4f} ====\n")
     return total_loss / len(loader)
 
 @torch.no_grad()
 def eval_one_epoch(model, loader, device):
     if len(loader) == 0:
-        return float("nan")
+        return float("nan"), 0.0
     model.eval()
     total_loss = 0.0
+    hard_correct = 0
+    total = 0
     for x, y, _ in loader:
         x, y = x.to(device), y.to(device)
-        _, loss = model(x, y)
+        logits, loss = model(x, y)
         total_loss += loss.item()
-    return total_loss / len(loader)
+        pred = logits.argmax(dim=-1)
+        hard_correct += (pred == y).sum().item()
+        total += y.size(0)
+    return total_loss / len(loader), hard_correct / max(total, 1)
 
 
 
@@ -119,14 +81,18 @@ def train_model(data_npy:str,close_npy:str):
     SEQ_LEN = 256          # 一次输入多少根K线
     BATCH_SIZE = 32
     LR = 3e-4
-    MAX_EPOCH = 500
+    MAX_EPOCH = 100
     EVAL_EVERY = 2       # 每多少迭代评估一次
     SAVE_EVERY = 5
     SPLIT_RATIO_1 = 0.7      # 训练集占比
     SPLIT_RATIO_2 = 0.2      # 验证集占比
     N_BINS = 64
     N_FEAT = 4
-    VOCAB_SIZE = N_BINS * N_FEAT
+    INPUT_VOCAB_SIZE = N_BINS * N_FEAT
+    OUTPUT_VOCAB_SIZE = 64
+    N_LAYER=4
+    N_EMBD=128
+    N_HEAD=8
     start_epoch =0
 
     es_patience = 3
@@ -141,11 +107,12 @@ def train_model(data_npy:str,close_npy:str):
     print(f"train_loader len:{len(train_loader)}")
     # 模型
     model = KlineGPT(
-        vocab_size=VOCAB_SIZE,
+        input_vocab_size=INPUT_VOCAB_SIZE,
+        output_vocab_size=OUTPUT_VOCAB_SIZE,
         n_feat=N_FEAT,
-        n_layer=6,
-        n_head=8,
-        n_embd=256,
+        n_layer=N_LAYER,
+        n_head=N_HEAD,
+        n_embd=N_EMBD,
         max_kline_seq=SEQ_LEN,
         use_learnable_fuse=True
     ).to(device)
@@ -154,7 +121,7 @@ def train_model(data_npy:str,close_npy:str):
     # model = torch.compile(model, dynamic=False)
 
     
-    optimizer = torch.optim.AdamW(model.parameters(), lr=LR, betas=(0.9, 0.95))
+    optimizer = torch.optim.AdamW(model.parameters(), lr=LR, betas=(0.9, 0.95),weight_decay=0.1)
 
     # ========== 学习率调度配置 ==========
     WARMUP_EPOCH = 10       # warmup 5~10 epoch，小数据集用10
@@ -224,11 +191,14 @@ def train_model(data_npy:str,close_npy:str):
         # 按EVAL_EVERY执行验证
         if epoch % EVAL_EVERY == 0:
             t0v = time.time()
-            val_loss = eval_one_epoch(model, val_loader, device)
+            
+            val_loss, val_acc = eval_one_epoch(model, val_loader, device)
+            t1v = time.time()
+            print(f"Epoch {epoch:03d} | val_loss:{val_loss:.4f} | val_acc:{val_acc:.4f} | val_cost {t1v-t0v:.2f}s")
 
             val_loss_history.append(val_loss )
-            t1v = time.time()
-            print(f"Epoch {epoch:03d} | val_loss:{train_loss:.4f} | val_cost {t1v-t0v:.2f}s")
+            
+            
             # ===== 早停判断放在eval之后 =====
             early_stopper(val_loss)
             if early_stopper.early_stop:
@@ -262,88 +232,63 @@ def train_model(data_npy:str,close_npy:str):
         ckpt = torch.load(best_ckpt_file, map_location=device)
         model.load_state_dict(ckpt["model_state"])
         print("✅ 加载 best ckpt 用于 test")
-        test_loss = eval_one_epoch(model, test_loader, device)
+        test_loss, test_acc = eval_one_epoch(model, test_loader, device)
     else:
         print("⚠️ best ckpt 不存在，用当前权重测 test")
-        test_loss = eval_one_epoch(model, test_loader, device)
+        test_loss , test_acc = eval_one_epoch(model, test_loader, device)
 
     
-    print(f"test loss: {test_loss:.4f}")
+    print(f"test loss: {test_loss:.4f}, test acc: {test_acc:.4f}")
 
-def inference_1(device,loader,model,tokenizer):
-    # 取一个样本
-    
+def inference_1(device, loader, model, tokenizer):
     for x, y, last_close in loader:
-        history_tokens = x.to(device)  # (1, seq_len, 4)
+        history_tokens = x.to(device)
         prev_close = last_close.item()
         break
 
     with torch.no_grad():
-        next_token = model.generate_next_kline(history_tokens, temperature=0.9)
+        next_token = model.generate_next_kline(history_tokens, temperature=0.9)  # (1, 1)
 
-    # 预测token
-    next_token_np = next_token.cpu().numpy().squeeze(0)
-    # 真实标签：y shape [1, 256, 4]，最后一个位置才是下一根K线的真实token
-    true_next_token_np = y[:, -1, :].cpu().numpy()
-    
+    pred_token = next_token.cpu().numpy().reshape(-1)[0]       # 标量
+    true_token = y.cpu().numpy().reshape(-1)[0]                # 标量
     
 
-    pred_local_token_dict = tokenizer.remove_offset(next_token_np)
-    true_local_token_dict = tokenizer.remove_offset(true_next_token_np)
+    single_tok = tokenizer.tokenizers["close_rel"]
+    pred_rel = float(single_tok.decode(np.array([pred_token]))[0])
+    true_rel = float(single_tok.decode(np.array([true_token]))[0])
 
-    # 解码成rel
-    pred_rel_dict = tokenizer.decode_batch(pred_local_token_dict)
-    true_rel_dict = tokenizer.decode_batch(true_local_token_dict)
+    pred_close = prev_close * (1.0 + pred_rel)
+    true_close = prev_close * (1.0 + true_rel)
 
-
-    pred_kline = rel_to_kline(prev_close, 
-                              pred_rel_dict["close_rel"][0].item(), 
-                              pred_rel_dict["high_rel"][0].item(), 
-                              pred_rel_dict["low_rel"][0].item(), 
-                              pred_rel_dict["vol_rel"][0].item())
-    true_kline = rel_to_kline(prev_close, 
-                              true_rel_dict["close_rel"][0].item(),
-                              true_rel_dict["high_rel"][0].item(),
-                              true_rel_dict["low_rel"][0].item(),
-                              true_rel_dict["vol_rel"][0].item(),  
-                              )
-
-    # ========== 对比打印 ==========
-    print("="*80)
-    print(f"{'feature':<12} | {'pred_token':<10} | {'true_token':<10} | {'pred_rel':<12} | {'true_rel':<12}")
-    print("-"*80)
-    feat_names = ["close_rel", "high_rel", "low_rel", "vol_rel"]
-    for i, fname in enumerate(feat_names):
-        pt = next_token_np[0, i]
-        tt = true_next_token_np[0, i]
-        pr = pred_rel_dict[fname][0].item()
-        tr = true_rel_dict[fname][0].item()
-        print(f"{fname:<12} | {pt:<10d} | {tt:<10d} | {pr:<12.6f} | {tr:<12.6f}")
-    print("="*80)
-    print(f"【预测K线】 {pred_kline}")
-    print(f"【真实K线】 {true_kline}")
-    print("="*80)
+    print("=" * 80)
+    print(f"pred_token: {pred_token}, true_token: {true_token}")
+    print(f"pred_close_rel: {pred_rel:.6f}, true_close_rel: {true_rel:.6f}")
+    print(f"pred_close: {pred_close:.4f}")
+    print(f"true_close: {true_close:.4f}")
+    print("=" * 80)
 
 
-def inference(data_npy:str,close_npy:str,kline_bounds:str ="kline_bounds.json",kline_gpt_ckpt :str ="kline_gpt_rope_ckpt.pt"):
+def inference(data_npy:str,close_npy:str,kline_bounds:str ="kline_bounds.json",kline_gpt_ckpt :str ="ckpt_best.pt"):
     
     device = "cuda" if torch.cuda.is_available() else "cpu"
 
-    VOCAB_SIZE=256
+    INPUT_VOCAB_SIZE=256
+    OUT_VOCAB_SIZE=64
     N_FEAT=4
     SEQ_LEN=256
-    N_LAYER=6
+    N_LAYER=4
     N_HEAD=8
-    N_EMBD=256
+    N_EMBD=128
     BATCH_SIZE=1
-    SPLIT_RATIO_1=0.8
-    SPLIT_RATIO_2=0.1
+    SPLIT_RATIO_1=0.7
+    SPLIT_RATIO_2=0.2
     dropout_rate=0.1
     
     tokenizer = MultiQuantileTokenizer.load(kline_bounds)
     
-    model = KlineGPT(
-            vocab_size=VOCAB_SIZE,
+    model = KlineGPT(            
+            input_vocab_size=INPUT_VOCAB_SIZE,
+            output_vocab_size=OUT_VOCAB_SIZE,
             n_feat=N_FEAT,
             n_layer=N_LAYER,
             n_head=N_HEAD,
