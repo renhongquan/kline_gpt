@@ -1,0 +1,238 @@
+# KlineGPT-RoPE
+
+基于 RoPE（旋转位置编码）的 K 线序列预测模型，使用 GPT 风格的 Transformer 对 K 线 token 序列建模，预测下一根 K 线的价格变动。项目按职责拆分为 4 个 Python 文件：tokenizer、模型、工具函数、训练/推理入口。
+
+## 📋 项目简介
+
+本项目把 K 线预测拆成三个独立阶段：**token 化 → 序列建模 → 训练/推理**。
+
+1. **K 线 token 化**：用分位数 tokenizer 把 4 个连续特征（close/high/low/vol 的相对变动）量化为离散 token，每个特征 64 个桶，拼成 256 词表。
+2. **序列建模**：用带 RoPE 的因果自注意力 Transformer，输入 256 根历史 K 线，预测下一根 K 线的 token。
+3. **训练/推理**：支持早停、warmup + 余弦退火、断点续训、loss 曲线可视化、checkpoint 加载推理。
+
+## 🗂️ 文件结构
+
+```
+.
+├── kline_tokenizer.py     # 分位数 tokenizer + 数据预处理
+├── kline_model.py         # RoPE / Attention / Block / KlineGPT_RoPE
+├── util.py                # Dataset、DataLoader、早停、checkpoint、绘图、K线还原
+├── train.py               # 训练入口 + 推理入口
+├── kline_bounds.json      # 分位数边界（pre_data 生成）
+├── stacked_tokens.npy     # K 线 token 序列 (N, 4)（pre_data 生成）
+├── close_ref.npy          # 每根 K 线收盘价参考 (N,)（pre_data 生成）
+├── kline_gpt_rope_ckpt.pt # 训练 checkpoint（自动生成）
+├── ckpt_best.pt           # 最佳验证 loss 的 checkpoint（自动生成）
+└── loss_curve.png         # loss 曲线图（自动生成）
+```
+
+### 各文件职责
+
+| 文件 | 职责 |
+|---|---|
+| `kline_tokenizer.py` | `SingleQuantileTokenizer`（单特征分位数分桶）、`MultiQuantileTokenizer`（多特征 + offset 拼装）、`pre_data()`（CSV → npy/json 预处理）、`rel_to_price` |
+| `kline_model.py` | `RoPE`、`CausalSelfAttention`、`MLP`、`Block`、`KlineGPT_RoPE` |
+| `util.py` | `KlineSeqDataset`、`get_dataloader`、`EarlyStopping`、`save_checkpoint`、`load_checkpoint`、`plot_loss_curve`、`rel_to_kline` |
+| `train.py` | `train_one_epoch`、`eval_one_epoch`、`train_model`、`inference`、`inference_1`、主入口 |
+
+## 🏗️ 模型架构
+
+```
+K 线 token 序列 (B, 256, 4)
+        ↓
+   Embedding (vocab=256, n_embd=256)   每个特征独立查表
+        ↓
+   Learnable Fuse (4×256 → 256)        拼接 4 个特征 embedding 后线性融合
+        ↓
+   × 6 Transformer Blocks
+   ├── RMSNorm → Causal Self-Attention (RoPE) → Dropout → 残差
+   └── RMSNorm → MLP (GELU) → Dropout → 残差
+        ↓
+   RMSNorm (ln_f)
+        ↓
+   4 个 Linear Head → 每个特征 (B, T, vocab) logits
+```
+
+**关键组件：**
+
+| 组件 | 说明 |
+|---|---|
+| `RoPE` | 旋转位置编码，预计算 `freqs_cis` buffer，支持 `start_pos` 增量推理 |
+| `CausalSelfAttention` | 因果掩码 + RoPE + `qkv` 合并投影 |
+| `MLP` | 4× 扩展的 GELU 前馈网络 |
+| `Block` | Pre-Norm 残差结构 |
+| `KlineGPT_RoPE` | 完整模型，`use_learnable_fuse` 控制融合方式 |
+
+## 🚀 快速开始
+
+### 环境依赖
+
+```bash
+pip install torch numpy pandas matplotlib
+```
+
+### 第一步：数据预处理
+
+准备一份 K 线 CSV（列名含 `open_time, close, high, low, volume`），修改 `kline_tokenizer.py` 中 `pre_data()` 的 `CSV_PATH`，然后运行：
+
+```bash
+python kline_tokenizer.py
+```
+
+会生成：
+
+- `stacked_tokens_1d.npy`：`(N, 4)` int64，4 列分别为 `close_rel, high_rel, low_rel, vol_rel` 的 token（已 `add_offset`，范围 0-255）
+- `close_ref_1d.npy`：`(N,)` float32，每根 K 线收盘价
+- `kline_bounds_1d.json`：tokenizer 的分位数边界
+
+> 注意：`pre_data()` 默认用前 90% 时序 fit tokenizer，防止验证集信息泄漏。输出文件名带 `_1d` 后缀，如用于其他周期请自行改名。
+
+### 第二步：训练
+
+修改 `train.py` 主入口中的 `data_npy` 和 `close_npy` 指向你的文件，然后运行：
+
+```bash
+python train.py
+```
+
+训练会自动：
+
+- 按 7:2:1 划分 train/val/test
+- 每 `EVAL_EVERY` 个 epoch 评估验证集
+- 保存最佳 checkpoint 到 `ckpt_best.pt`
+- 每 `SAVE_EVERY` 个 epoch 保存完整 checkpoint 和 loss 曲线
+- 检测到 `kline_gpt_rope_ckpt.pt` 时自动断点续训
+
+### 第三步：推理
+
+`train.py` 主入口默认先训练再推理。如果只想推理，注释掉 `train_model()`，保留 `inference(...)`：
+
+```python
+if __name__ == "__main__":
+    ...
+    # train_model()
+    inference(data_npy, close_npy)
+```
+
+`inference()` 会加载 `ckpt_best.pt`，对 train/val/test 各取一个样本，预测下一根 K 线的 4 个特征 token，解码成 rel 并还原成 K 线，与真实值对比打印。
+
+## ⚙️ 超参配置
+
+在 `train.py` 的 `train_model()` 中修改：
+
+| 参数 | 默认值 | 说明 |
+|---|---|---|
+| `SEQ_LEN` | 256 | 输入 K 线窗口长度 |
+| `BATCH_SIZE` | 32 | 批大小 |
+| `LR` | 3e-4 | 初始学习率 |
+| `MAX_EPOCH` | 500 | 最大训练轮数 |
+| `EVAL_EVERY` | 2 | 每多少 epoch 评估一次 |
+| `SAVE_EVERY` | 5 | 每多少 epoch 保存一次 |
+| `SPLIT_RATIO_1` | 0.7 | 训练集占比 |
+| `SPLIT_RATIO_2` | 0.2 | 验证集占比 |
+| `N_BINS` | 64 | 每个特征分桶数 |
+| `N_FEAT` | 4 | 特征数 |
+| `WARMUP_EPOCH` | 10 | 学习率 warmup 轮数 |
+| `es_patience` | 3 | 早停耐心值 |
+
+模型结构参数（`KlineGPT_RoPE(...)`）：
+
+| 参数 | 默认值 |
+|---|---|
+| `n_layer` | 6 |
+| `n_head` | 8 |
+| `n_embd` | 256 |
+| `dropout_rate` | 0.1 |
+| `use_learnable_fuse` | True |
+
+## 🔧 关键设计说明
+
+### 1. Tokenizer 的 offset 机制
+
+`MultiQuantileTokenizer` 给每个特征分配一段独立的 token 区间：
+
+```
+close_rel: [0,   63]
+high_rel:  [64,  127]
+low_rel:   [128, 191]
+vol_rel:   [192, 255]
+```
+
+`add_offset` 把 4 个特征的局部 token 拼成 `(N, 4)` 的堆叠 token，模型用统一词表 `vocab_size=256` 查表；`remove_offset` 反向还原成各特征的局部 token，再 `decode_batch` 还原成 rel 值。
+
+### 2. 训练时的序列切分
+
+`util.py` 的 `KlineSeqDataset.__getitem__`：
+
+```python
+x = self.data[idx : idx + self.seq_len]           # (256, 4)
+y = self.data[idx+1 : idx + self.seq_len + 1]     # (256, 4)
+last_close = self.close_ref[idx + self.seq_len - 1]
+```
+
+模型对**每个位置**都算 loss（`logits_list` 是 `(B, T, vocab)`），是标准的 next-token 预测。注意这与“只预测窗口后一根”的变体不同——当前版本 `y` 和 `x` 在时间上重叠，靠因果掩码保证位置 `t` 只能看到 `≤t` 的输入，预测 `t+1`，是合法的语言模型训练方式。
+
+### 3. RoPE 位置编码
+
+`RoPE` 在 `__init__` 里预计算 `max_kline_len` 个位置的 `freqs_cis`，`forward` 时按 `start_pos` 切片。这样支持未来做增量推理（只算新 token 的 position）。
+
+### 4. 早停与断点续训
+
+`EarlyStopping` 记录 `best_loss` 和 `counter`，`save_checkpoint` 把它和 `best_val_loss` 一起存进 checkpoint。`load_checkpoint` 恢复这些状态，避免重训时早停计数从 0 开始。
+
+### 5. 数据划分与防泄漏
+
+`get_dataloader` 按时间顺序切分 `train/val/test`（`df_np[:n_train]` 等），**不打乱时间顺序**。tokenizer 的 `fit` 只在训练片段上做（`pre_data` 中 `TRAIN_SPLIT_RATIO=0.9`），避免验证集信息泄漏到分位数边界。
+
+## 📊 训练监控
+
+每个 epoch 打印：
+
+```
+current_lr: 0.0003
+Epoch 005 | train_loss: 3.2145 | train_cost 12.34s
+Epoch 005 | val_loss: 3.3012 | val_cost 2.11s
+```
+
+`train_one_epoch` 还会打印每个特征的 `loss / hard_acc / soft_adj_acc`：
+
+```
+==== Eval Feature Metrics ====
+close_rel  | loss:3.2145 | hard_acc:0.4521 | soft_adj_acc:0.6832
+high_rel   | loss:3.3012 | hard_acc:0.4310 | soft_adj_acc:0.6614
+low_rel    | loss:3.2876 | hard_acc:0.4402 | soft_adj_acc:0.6701
+vol_rel    | loss:3.3521 | hard_acc:0.4123 | soft_adj_acc:0.6455
+==============================
+```
+
+梯度告警（每 10 个 batch 检查一次）：
+
+- `⚠️ 梯度norm偏高`：连续 10 个 batch 平均 > 5.0，建议降 LR
+- `⚠️ 梯度norm很低`：连续 10 个 batch 平均 < 1e-3，警惕梯度消失
+
+## ⚠️ 注意事项
+
+1. **数据列顺序**：`stacked_tokens.npy` 的列顺序必须与 `FEATURES = ["close_rel", "high_rel", "low_rel", "vol_rel"]` 一致，`remove_offset` 按 `feature_names` 的顺序取列。
+2. **旧版 json 兼容**：`MultiQuantileTokenizer.load` 支持没有 `offsets` 字段的旧 json，会按 `feature_names` 顺序重算 offset。
+3. **GPU 显存**：6 层 256 维 + `batch_size=32` + `seq_len=256`，T4（16GB）上约 3-5 GB，显存充足时可加大 `BATCH_SIZE`。
+4. **`inference()` 的划分比例**：`inference()` 里写死了 `SPLIT_RATIO_1=0.8, SPLIT_RATIO_2=0.1`，与 `train_model()` 的 0.7/0.2 **不一致**。如果要用训练时的 val/test 做推理对比，需要把两处改成一致。
+5. **`num_workers=0`**：`util.py` 的 DataLoader 用的是 `num_workers=0`，GPU 训练时如果数据加载成为瓶颈，可改成 4 并加 `pin_memory=True`。
+6. **`soft_adj_acc` 的含义**：用 `abs(pred - y) <= 1` 判断“相邻桶算对”。由于 token 加了 offset，跨特征边界处（如 close 的 63 和 high 的 64）会被误判为相邻，这个指标偏乐观，建议以 `hard_acc` 为准。
+
+## 📝 待改进
+
+- [ ] `inference()` 与 `train_model()` 的 `SPLIT_RATIO` 统一
+- [ ] 支持“只预测窗口后一根”的变体（`y = data[idx+seq_len]`），与当前 next-token 版本做 A/B 对比
+- [ ] 加入混合精度训练（AMP）加速
+- [ ] 支持 `torch.compile` 优化
+- [ ] 加入 walk-forward 验证
+- [ ] 支持多标的联合训练
+- [ ] `soft_adj_acc` 改为同特征内判断，避免跨边界误判
+
+## 📄 License
+
+MIT
+
+---
+
+**免责声明**：本项目仅供研究和学习使用，不构成任何投资建议。K 线预测存在极高风险，请勿直接用于实盘交易。

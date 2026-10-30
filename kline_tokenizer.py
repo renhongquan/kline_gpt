@@ -153,10 +153,10 @@ def rel_to_price(rel_dict: dict[str, np.ndarray], prev_base_price: float):
 
 def pre_data():
     # --------配置区--------
-    CSV_PATH = "./finetune_csv/data/btc_1d.csv"
-    OUT_NPY = "stacked_tokens_1d.npy"
-    OUT_CLOSE_NPY = "close_ref_1d.npy"
-    OUT_JSON = "kline_bounds_1d.json"
+    CSV_PATH = "./data/btc_1d.csv"
+    OUT_NPY = "stacked_tokens.npy"
+    OUT_CLOSE_NPY = "close_ref.npy"
+    OUT_JSON = "kline_bounds.json"
 
     # 和你代码保持一致的4个特征
     FEATURES = ["close_rel", "high_rel", "low_rel", "vol_rel"]

@@ -114,7 +114,7 @@ def eval_one_epoch(model, loader, device):
 
 
 
-def train_model():
+def train_model(data_npy:str,close_npy:str):
     # -------------------------- 超参配置（对齐你nanochat风格） --------------------------
     SEQ_LEN = 256          # 一次输入多少根K线
     BATCH_SIZE = 32
@@ -136,7 +136,7 @@ def train_model():
     device = "cuda" if torch.cuda.is_available() else "cpu"
     print(f"using device: {device}")
     
-    train_loader,val_loader,test_loader =get_dataloader(SEQ_LEN,BATCH_SIZE,SPLIT_RATIO_1,SPLIT_RATIO_2)
+    train_loader,val_loader,test_loader =get_dataloader(SEQ_LEN,BATCH_SIZE,SPLIT_RATIO_1,SPLIT_RATIO_2,data_npy,close_npy)
        
     print(f"train_loader len:{len(train_loader)}")
     # 模型
@@ -376,5 +376,5 @@ if __name__ == "__main__":
     np.random.seed(SEED)
     torch.manual_seed(SEED)
     torch.cuda.manual_seed_all(SEED)
-    train_model() 
+    train_model(data_npy,close_npy) 
     inference(data_npy,close_npy)   
