@@ -99,7 +99,7 @@ class Block(nn.Module):
         return x
 
 
-class KlineGPT_RoPE(nn.Module):
+class KlineGPT(nn.Module):
     def __init__(
         self,
         vocab_size: int,

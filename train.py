@@ -140,7 +140,7 @@ def train_model(data_npy:str,close_npy:str):
        
     print(f"train_loader len:{len(train_loader)}")
     # 模型
-    model = KlineGPT_RoPE(
+    model = KlineGPT(
         vocab_size=VOCAB_SIZE,
         n_feat=N_FEAT,
         n_layer=6,
@@ -342,7 +342,7 @@ def inference(data_npy:str,close_npy:str,kline_bounds:str ="kline_bounds.json",k
     
     tokenizer = MultiQuantileTokenizer.load(kline_bounds)
     
-    model = KlineGPT_RoPE(
+    model = KlineGPT(
             vocab_size=VOCAB_SIZE,
             n_feat=N_FEAT,
             n_layer=N_LAYER,

@@ -1,6 +1,6 @@
-# KlineGPT-RoPE
+# KlineGPT
 
-基于 RoPE（旋转位置编码）的 K 线序列预测模型，使用 GPT 风格的 Transformer 对 K 线 token 序列建模，预测下一根 K 线的价格变动。项目按职责拆分为 4 个 Python 文件：tokenizer、模型、工具函数、训练/推理入口。
+基于分位数编码的 K 线序列预测模型，使用 GPT 风格的 Transformer 对 K 线 token 序列建模，预测下一根 K 线的价格变动。项目按职责拆分为 4 个 Python 文件：tokenizer、模型、工具函数、训练/推理入口。
 
 ## 📋 项目简介
 
@@ -15,7 +15,7 @@
 ```
 .
 ├── kline_tokenizer.py     # 分位数 tokenizer + 数据预处理
-├── kline_model.py         # RoPE / Attention / Block / KlineGPT_RoPE
+├── kline_model.py         # RoPE / Attention / Block / KlineGPT
 ├── util.py                # Dataset、DataLoader、早停、checkpoint、绘图、K线还原
 ├── train.py               # 训练入口 + 推理入口
 ├── kline_bounds.json      # 分位数边界（pre_data 生成）
@@ -31,7 +31,7 @@
 | 文件 | 职责 |
 |---|---|
 | `kline_tokenizer.py` | `SingleQuantileTokenizer`（单特征分位数分桶）、`MultiQuantileTokenizer`（多特征 + offset 拼装）、`pre_data()`（CSV → npy/json 预处理）、`rel_to_price` |
-| `kline_model.py` | `RoPE`、`CausalSelfAttention`、`MLP`、`Block`、`KlineGPT_RoPE` |
+| `kline_model.py` | `RoPE`、`CausalSelfAttention`、`MLP`、`Block`、`KlineGPT` |
 | `util.py` | `KlineSeqDataset`、`get_dataloader`、`EarlyStopping`、`save_checkpoint`、`load_checkpoint`、`plot_loss_curve`、`rel_to_kline` |
 | `train.py` | `train_one_epoch`、`eval_one_epoch`、`train_model`、`inference`、`inference_1`、主入口 |
 
@@ -61,7 +61,7 @@ K 线 token 序列 (B, 256, 4)
 | `CausalSelfAttention` | 因果掩码 + RoPE + `qkv` 合并投影 |
 | `MLP` | 4× 扩展的 GELU 前馈网络 |
 | `Block` | Pre-Norm 残差结构 |
-| `KlineGPT_RoPE` | 完整模型，`use_learnable_fuse` 控制融合方式 |
+| `KlineGPT` | 完整模型，`use_learnable_fuse` 控制融合方式 |
 
 ## 🚀 快速开始
 
@@ -135,7 +135,7 @@ if __name__ == "__main__":
 | `WARMUP_EPOCH` | 10 | 学习率 warmup 轮数 |
 | `es_patience` | 3 | 早停耐心值 |
 
-模型结构参数（`KlineGPT_RoPE(...)`）：
+模型结构参数（`KlineGPT(...)`）：
 
 | 参数 | 默认值 |
 |---|---|
